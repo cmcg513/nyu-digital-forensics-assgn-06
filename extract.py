@@ -5,44 +5,38 @@
 
 import os
 import shutil
-# import re
-# import sys
 import logging
 import argparse
 import subprocess
 import sqlalchemy as sql
 import sqlalchemy.ext.declarative as declr
 from PIL import Image
+from PIL.ExifTags import TAGS
 import pyPdf
+import hashlib
 
-# setting up SQLAlchemy for DB creation/manipulation and limiting logger output to ERROR only
+# setting up DB base class and limiting logger output to ERROR only
 # source: CS-GY 6963, Module 6, fingerprint.py
-# try:
-# 	from sqlalchemy import Column, Integer, Float, String, Text
-# 	from sqlalchemy.ext.declarative import declarative_base
-# 	from sqlalchemy.orm import sessionmaker
-# 	from sqlalchemy import create_engine
-# except ImportError as e:
-# 	print "Module `{0}` not installed".format(error.message[16:])
-# 	sys.exit()
 Base = declr.declarative_base()
 
 logging.basicConfig()
 logging.getLogger('sqlalchemy.engine').setLevel(logging.ERROR)
 
 # Class for the SQL DB schema
-class FileInfo(Base):
+class fileInfo(Base):
 	__tablename__ = 'file'
 
 	id = sql.Column(sql.Integer,primary_key = True)
 	Filename = sql.Column(sql.String)
 	MD5Hash = sql.Column(sql.String)
+	Type = sql.Column(sql.String)
 	SourceImage = sql.Column(sql.String)
 	Metadata = sql.Column(sql.String)
 
-	def __init__(self,Filename,MD5Hash,SourceImage,Metadata):
+	def __init__(self,Filename,MD5Hash,Type,SourceImage,Metadata):
 		self.Filename = Filename
 		self.MD5Hash = MD5Hash
+		self.Type = Type
 		self.SourceImage = SourceImage
 		self.Metadata = Metadata
 
@@ -51,7 +45,7 @@ class pdfAndImageCarver(object):
 
 	# intialization procedure
 	# modified from: CS-GY 6963, Module 6, fingerprint.py
-	def __init__(self,img):
+	def __init__(self,img,ignore_existing_dirs=False):
 		# sanity check
 		if img == "":
 			raise Exception("No disk image provided.")
@@ -63,18 +57,28 @@ class pdfAndImageCarver(object):
 		present_dir = os.path.dirname(os.path.abspath(__file__))
 		self.extract_dir = '{0}/extract/{1}'.format(present_dir, self.filename)
 		self.tmp_extract_dir = '{0}/tmp_extract/'.format(present_dir)
+		self.report_entries = []
 
-		# raise exception if directory already exists
-		if os.path.exists(self.extract_dir):
-			raise Exception('Extraction directory {0} already exists. Remove directory if you wish to try to extract this image again.'.format(self.extract_dir))
+		# check if the force flag was set
+		if not ignore_existing_dirs:
+			# raise exception if directory already exists
+			if os.path.exists(self.extract_dir):
+				raise Exception('Extraction directory {0} already exists. Remove directory if you wish to try to extract this image again.'.format(self.extract_dir))
 
-		# raise exception if directory already exists
-		if os.path.exists(self.tmp_extract_dir):
-			raise Exception('Temporary extraction directory {0} already exists. This is likely due to an previous uncompleted execution of this script; remove the directory manually and try again.'.format(self.tmp_extract_dir))
+			# raise exception if directory already exists
+			if os.path.exists(self.tmp_extract_dir):
+				raise Exception('Temporary extraction directory {0} already exists. This is likely due to an previous uncompleted execution of this script; remove the directory manually and try again.'.format(self.tmp_extract_dir))
 
-		# create necessary directories
-		os.makedirs(self.extract_dir)
-		os.makedirs(self.tmp_extract_dir)
+			# create necessary directories
+			os.makedirs(self.extract_dir)
+			os.makedirs(self.tmp_extract_dir)
+		else: # if the force flag was set, don't worry about exisiting directories
+			if not os.path.exists(self.extract_dir):
+				os.makedirs(self.extract_dir)
+
+			if not os.path.exists(self.tmp_extract_dir):
+				os.makedirs(self.tmp_extract_dir)
+
 
 		# setup database
 		self.db = "carved_files.db"
@@ -84,9 +88,28 @@ class pdfAndImageCarver(object):
 		Session = sql.orm.sessionmaker(bind=self.engine)
 		self.session = Session()
 
-	# a cleanup procedure to remove the temporary directory
+	# a cleanup procedure to remove the temporary directory, close the DB and write the report
 	def done(self):
 		shutil.rmtree(self.tmp_extract_dir)
+		# close db
+		self.session.close()
+		# write to report
+		report_name = "extraction_report.txt"
+		if os.path.exists(report_name):
+			fileobj = open(report_name, "a")
+		else:
+			fileobj = open(report_name, "w")
+			fileobj.write("extract.py Report file")
+		fileobj.write("\n\n>>>>> Report for disk image: {0}\n\n".format("".join([self.filename,self.extension])))
+		for entry in self.report_entries:
+			fileobj.write("Filename: {0}\n".format(entry['filename']))
+			fileobj.write("\tMD5: {0}\n".format(entry['md5']))
+			fileobj.write("\tType: {0}\n".format(entry['type']))
+			fileobj.write("\tMetadata: {0}\n\n".format(entry['metadata']))
+		fileobj.write("\n======================================================================================================")
+		fileobj.close()
+			
+
 
 	# use subprocess module to call the Sleuthkit and carve files out to
 	# new directory
@@ -94,29 +117,115 @@ class pdfAndImageCarver(object):
 	def carve(self):
 		try:
 			subprocess.check_output(["tsk_recover","-e", self.img, self.tmp_extract_dir])
-			# subprocess.check_output(["tsk_loaddb","-d","{0}/{1}.db".format(self.dir, self.fn), self.img])
 		except:
 			raise Exception('Error carving image.')
 
 	# walk through the directory of carved files and grab the images and pdfs
 	# modified from: CS-GY 6963, Module 6, exif.py, pdf.py
 	def find_pdfs_and_images(self):
+		# walk the directory generated by TSK
 		for current_dir, dirnames, filenames in os.walk(self.tmp_extract_dir):
 			for filename in filenames:
+				# get full path
+				filepath = os.path.join(current_dir, filename)
+				# get extension
+				tmp, extension = os.path.splitext(filename)
+				extension = extension.lower().strip()
+
+				isImage = False
+
+				# try to open with PIL.Image
 				try:
-					image_file = Image.open(Image.open(os.path.join(dirname, filename)))
+					image_file = Image.open(filepath)
+					metadata = self.get_image_metadata(image_file)
+					image_file.close()
+					isImage = True
 				except Exception, e:
-					try:
-						pdf_file = pyPdf.PdfFileReader(file(os.path.join(dirname, filename), 'rb'))
-					except Exception, e:
+					# if it failed to open in PIL.Image, but the extension corresponds to a known image,
+					# include it anyway; note that this list is obviously not exhaustive
+					if extension in [".jpg",".tif",".png",".xlxs",".gif",".bmp"]:
+						metadata = {"Unable to open with PIL.Image":None}
+						isImage = True
+
+					# check for PDF extension; necessary as pyPdf hangs on certain non-PDF files
+					elif extension == ".pdf":
+						fileobj = file(filepath, 'rb')
+						try:
+							pdf_file = pyPdf.PdfFileReader(fileobj)
+							metadata = self.get_pdf_metadata(pdf_file)
+						except Exception, e:
+							metadata = {"Unable to open with pyPdf":None}
+						finally:
+							fileobj.close()
+					else:
 						continue
-		# for dirname, dirnames, filenames in os.walk(args.dir):
-		# for fn in filenames:
-		# 	try:
-		# 		img = Image.open(os.path.join(dirname, fn))
-		# 		print retrieveExif(img)
-		# 	except Exception, e:
-		# 		continue
+				# get md5 hash
+				md5 = self.generate_md5_hash(filepath)
+
+				# add the files data to our report
+				if isImage:
+					self.add_to_report(filename, md5, "image", metadata)
+				else:
+					self.add_to_report(filename, md5, "pdf", metadata)
+
+				# copy the file from the temp folder
+				shutil.copy(filepath, self.extract_dir)
+
+	# returns image exif data, if any
+	# modified from: CS-GY 6963, Module 6, exif.py
+	def get_image_metadata(self,image_file):
+		info = image_file._getexif()
+		metadata = {}
+		if info:
+			for tag, value in info.items():
+				decoded = TAGS.get(tag, tag)
+				metadata[decoded] = value
+		return metadata
+
+	# returns PDF metadata, if any
+	# modified from: CS-GY 6963, Module 6, pdf.py
+	def get_pdf_metadata(self,pdf_file):
+		info = pdf_file.getDocumentInfo()
+		metadata = {}
+		for item, dat in info.items():
+			try:
+				metadata[item] = pdf_file.resolvedObjects[0][1][item]
+			except:
+				metadata[item] = dat
+		return metadata
+
+	# returns MD5 hash of given file
+	# modified from previous project of mine: https://github.com/toto-build-project/toto-build-and-test/blob/master/utils.py
+	def generate_md5_hash(self,filepath):
+		md5_hasher = hashlib.md5()
+
+		# Read the file as bytes
+		fileobj = open(filepath,"rb")
+
+		# We read the file in 128-byte chunks
+		while True:
+			data = fileobj.read(128)
+			if not data:
+				break
+			md5_hasher.update(data)
+		fileobj.close()
+		return md5_hasher.hexdigest()
+
+	# adds the file's info to the SQL DB and to the list which we will write to our report file
+	def add_to_report(self,filename,md5,file_type,metadata):
+		source_image = "".join([self.filename, self.extension])
+
+		# strip non-ASCII chars for the sake of SQL :)
+		filename = filename.decode('ascii', 'ignore')
+
+		# add to DB
+		row = fileInfo(filename, md5, file_type, source_image, str(metadata))
+		self.session.add(row)
+		self.session.commit()
+
+		# add to list
+		row_dict = {"filename": filename, "md5": md5, "type": file_type, "metadata": metadata}
+		self.report_entries.append(row_dict)
 
 # sets up the argument parser and returns the arguments themselves
 def parse_args():
@@ -124,6 +233,7 @@ def parse_args():
 	group = parser.add_mutually_exclusive_group(required=True)
 	group.add_argument("-i", "--image", metavar="IMAGES", type=str, nargs="+", help="Filename(s)/path(s) to the disk image(s) to be processed")
 	group.add_argument("-l", "--image_list", metavar="IMAGE_LIST", type=str, help="Filename/path of text file containing new-line separated paths for each image file to be processed")
+	parser.add_argument("-f", "--force", action="store_true", help="Flag determining if existing extraction directories should be overwritten")
 	return parser.parse_args()
 
 # the main routine; called when the script is run from the command line
@@ -142,9 +252,9 @@ def main():
 			if len(images) == 0:
 				raise Exception("No filepaths in specified file.")
 	for img in images:
-		print img + ": \n"
-		carver = pdfAndImageCarver(img)
+		carver = pdfAndImageCarver(img,args.force)
 		carver.carve()
+		carver.find_pdfs_and_images()
 		carver.done()
 
 if __name__ == "__main__":
